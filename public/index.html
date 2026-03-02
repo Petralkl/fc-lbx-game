@@ -639,6 +639,50 @@ input[type="text"]::placeholder { color: var(--muted); }
 .fill-mid  { background: var(--gold); }
 .fill-low  { background: var(--red); }
 
+
+/* ─── WATCHED TOGETHER LIST ─── */
+.watched-list {
+  display: grid;
+  gap: 6px;
+  max-height: 600px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.watched-row {
+  display: grid;
+  grid-template-columns: 36px 1fr auto;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  transition: border-color 0.15s;
+}
+.watched-row:hover { border-color: #333; }
+
+.watched-num {
+  font-family: 'DM Mono', monospace;
+  font-size: 0.65rem;
+  color: var(--muted);
+  text-align: right;
+}
+
+.watched-name { font-size: 0.85rem; }
+
+.watched-link {
+  color: var(--text);
+  text-decoration: none;
+}
+.watched-link:hover { color: var(--orange); }
+
+.watched-ratings {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
 /* ─── SCROLLBAR ─── */
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: var(--bg); }
@@ -786,8 +830,9 @@ function fillClass(pct) {
 
 function updateCounts() {
   const count = Object.keys(users).length;
-  const totalFilms = Object.values(users).reduce((s, u) => s + (u.filmCount || 0), 0);
-  document.getElementById('userCount').textContent = `${count} user${count !== 1 ? 's' : ''} · ${totalFilms.toLocaleString()} films scanned`;
+  const totalWatched = Object.values(users).reduce((s, u) => s + (u.watchedCount || 0), 0);
+  const totalRated = Object.values(users).reduce((s, u) => s + (u.ratedCount || 0), 0);
+  document.getElementById('userCount').textContent = `${count} user${count !== 1 ? 's' : ''} · ${totalWatched.toLocaleString()} watched · ${totalRated.toLocaleString()} rated`;
 
   const ctaBar = document.getElementById('ctaBar');
   const hint = document.getElementById('ctaHint');
@@ -830,7 +875,7 @@ function renderUsersGrid() {
       <div class="user-name">${u.profile?.displayName || u.username}</div>
       <div class="user-handle">@${u.username}</div>
       ${u.scanning ? `<div class="scanning-pill"><div class="dot-anim"></div>scanning...</div>` :
-        u.filmCount ? `<div class="user-meta">${u.filmCount.toLocaleString()} rated films</div>` : ''}
+        u.watchedCount ? `<div class="user-meta">${u.watchedCount.toLocaleString()} watched · ${u.ratedCount.toLocaleString()} rated</div>` : ''}
     </div>
   `).join('');
 }
@@ -862,11 +907,13 @@ async function addUser() {
       profile: data.profile,
       ratings: data.ratings,
       filmMeta: data.filmMeta,
-      filmCount: data.filmCount,
+      watched: data.watched,
+      watchedCount: data.watchedCount,
+      ratedCount: data.ratedCount,
       scanning: false,
     };
 
-    toast(`@${username} added · ${data.filmCount} films`, 'success');
+    toast(`@${username} added · ${data.watchedCount} watched, ${data.ratedCount} rated`, 'success');
   } catch (e) {
     delete users[username];
     toast(e.message, 'error');
@@ -959,7 +1006,7 @@ function matchRowHTML(pair, isBest) {
         <strong>@${pair.userA}</strong>
         <span class="vs">VS</span>
         <strong>@${pair.userB}</strong>
-        <div class="match-shared">${pair.sharedCount} shared films</div>
+        <div class="match-shared">${pair.sharedWatchedCount || pair.sharedCount || 0} watched together · ${pair.sharedRatedCount || 0} both rated</div>
       </div>
       <div>
         <div class="match-pct ${cls}">${pct}%</div>
@@ -1001,29 +1048,54 @@ function showPairDetail(pair) {
         </div>
       `).join('')}</div>`;
 
+  const watchedList = pair.sharedWatchedList || [];
+  const watchedHTML = watchedList.length === 0
+    ? `<div class="empty"><div class="empty-icon">📭</div>No shared watched films found.</div>`
+    : `
+      <div style="font-family:'DM Mono',monospace;font-size:0.7rem;color:var(--muted);padding:0 0 16px">
+        Showing ${watchedList.length} of ${pair.sharedWatchedCount} films watched by both users
+      </div>
+      <div class="watched-list">
+        ${watchedList.map((f, i) => `
+          <div class="watched-row">
+            <span class="watched-num">${i + 1}</span>
+            <div class="watched-name">
+              <a href="https://letterboxd.com/film/${f.slug}/" target="_blank" class="watched-link">${f.name}</a>
+            </div>
+            <div class="watched-ratings">
+              ${f.ratingA ? `<span class="star-rating star-a" style="font-size:0.7rem;padding:2px 8px">${f.ratingA}★</span>` : `<span style="color:var(--muted);font-size:0.7rem;font-family:'DM Mono',monospace">—</span>`}
+              ${f.ratingB ? `<span class="star-rating star-b" style="font-size:0.7rem;padding:2px 8px">${f.ratingB}★</span>` : `<span style="color:var(--muted);font-size:0.7rem;font-family:'DM Mono',monospace">—</span>`}
+            </div>
+          </div>
+        `).join('')}
+      </div>
+    `;
+
   document.getElementById('clashContent').innerHTML = `
     <div class="clash-pair-header">
       <span class="clash-user-badge badge-a">@${pair.userA}</span>
       <span class="clash-vs">VS</span>
       <span class="clash-user-badge badge-b">@${pair.userB}</span>
       <span style="margin-left:12px;font-family:'Bebas Neue',sans-serif;font-size:2rem" class="${pctClass(pct)}">${pct}% match</span>
-      <span style="font-family:'DM Mono',monospace;font-size:0.7rem;color:var(--muted)">${pair.sharedCount} films in common</span>
+      <span style="font-family:'DM Mono',monospace;font-size:0.7rem;color:var(--muted)">${pair.sharedWatchedCount} watched together · ${pair.sharedRatedCount} both rated</span>
     </div>
 
     <div class="tabs">
       <button class="tab active" onclick="switchTab(this,'clash-tab')">⚔️ CLASHES (${pair.clashFilms.length})</button>
       <button class="tab" onclick="switchTab(this,'agree-tab')">🤝 AGREEMENTS (${pair.agreements.length})</button>
+      <button class="tab" onclick="switchTab(this,'watched-tab')">🎬 WATCHED TOGETHER (${pair.sharedWatchedCount})</button>
     </div>
 
     <div id="clash-tab">${clashHTML}</div>
     <div id="agree-tab" style="display:none">${agreeHTML}</div>
+    <div id="watched-tab" style="display:none">${watchedHTML}</div>
   `;
 }
 
 function switchTab(btn, tabId) {
   btn.closest('.clash-section, #clashContent').querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   btn.classList.add('active');
-  ['clash-tab','agree-tab'].forEach(id => {
+  ['clash-tab','agree-tab','watched-tab'].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.style.display = id === tabId ? 'block' : 'none';
   });

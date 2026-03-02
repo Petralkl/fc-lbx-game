@@ -9,9 +9,8 @@ app.use(express.static('public'));
 
 const PORT = 3000;
 
-// Cache to avoid hammering Letterboxd
 const cache = new Map();
-const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+const CACHE_TTL = 5 * 60 * 1000;
 
 async function fetchLBD(url) {
   const cached = cache.get(url);
@@ -31,19 +30,18 @@ async function fetchLBD(url) {
   return html;
 }
 
-// Scrape a user's film ratings (paginated)
-async function getUserRatings(username, maxPages = 8) {
+async function scrapeFilmPage(username, mode, maxPages = 10) {
   const ratings = {};
   const filmMeta = {};
+  const watched = {};
 
   for (let page = 1; page <= maxPages; page++) {
-    const url = `https://letterboxd.com/${username}/films/rated/page/${page}/`;
+    const url = mode === 'rated'
+      ? `https://letterboxd.com/${username}/films/rated/page/${page}/`
+      : `https://letterboxd.com/${username}/films/page/${page}/`;
+
     let html;
-    try {
-      html = await fetchLBD(url);
-    } catch (e) {
-      break;
-    }
+    try { html = await fetchLBD(url); } catch (e) { break; }
 
     const $ = cheerio.load(html);
     const films = $('li.poster-container');
@@ -51,155 +49,120 @@ async function getUserRatings(username, maxPages = 8) {
 
     films.each((_, el) => {
       const $el = $(el);
-      const ratingEl = $el.find('.rating');
       const posterEl = $el.find('.film-poster');
-      
+      const ratingEl = $el.find('.rating');
+
       const slug = posterEl.attr('data-film-slug');
       const name = posterEl.attr('data-film-name') || posterEl.find('img').attr('alt');
+      if (!slug) return;
+
+      filmMeta[slug] = { name: name || slug, slug };
+      watched[slug] = true;
+
       const ratingClass = ratingEl.attr('class') || '';
       const match = ratingClass.match(/rated-(\d+)/);
-      
-      if (slug && match) {
-        const stars = parseInt(match[1]) / 2; // Convert 1-10 to 0.5-5
-        ratings[slug] = stars;
-        filmMeta[slug] = { name: name || slug, slug };
-      }
+      if (match) ratings[slug] = parseInt(match[1]) / 2;
     });
 
-    // Check if there's a next page
     const hasNext = $('a.next').length > 0;
     if (!hasNext) break;
   }
 
-  return { ratings, filmMeta };
+  return { ratings, filmMeta, watched };
 }
 
-// Scrape user profile info
 async function getUserProfile(username) {
-  try {
-    const html = await fetchLBD(`https://letterboxd.com/${username}/`);
-    const $ = cheerio.load(html);
-    
-    const displayName = $('h1.title-1').text().trim() || username;
-    const avatar = $('div.profile-avatar img').attr('src') || null;
-    const filmCount = $('a[href*="/films/"]').filter((_, el) => {
-      return $(el).closest('.profile-stats').length > 0;
-    }).first().text().trim();
+  const html = await fetchLBD(`https://letterboxd.com/${username}/`);
+  const $ = cheerio.load(html);
 
-    // Check if user exists
-	const notFound = $('section.error').length > 0 || html.includes("Sorry, we can't find the page");
-    if (notFound) throw new Error('User not found');
+  const notFound = $('section.error').length > 0 || html.includes("Sorry, we can't find the page");
+  if (notFound) throw new Error(`User "${username}" not found on Letterboxd`);
 
-    return { username, displayName, avatar };
-  } catch (e) {
-    throw new Error(`User "${username}" not found on Letterboxd`);
-  }
+  const displayName = $('h1.title-1').text().trim() || username;
+  const avatar = $('div.profile-avatar img').attr('src') || null;
+
+  return { username, displayName, avatar };
 }
 
-// Compute match % and clash films between two users
 function compareUsers(userA, userB) {
-  const ratingsA = userA.ratings;
-  const ratingsB = userB.ratings;
+  const ratingsA = userA.ratings || {};
+  const ratingsB = userB.ratings || {};
+  const watchedA = userA.watched || {};
+  const watchedB = userB.watched || {};
   const allMeta = { ...userA.filmMeta, ...userB.filmMeta };
 
-  const sharedFilms = Object.keys(ratingsA).filter(slug => ratingsB[slug] !== undefined);
-  
-  if (sharedFilms.length === 0) {
-    return { matchPercent: 0, sharedCount: 0, clashFilms: [], agreements: [] };
-  }
+  const bothRated = Object.keys(ratingsA).filter(slug => ratingsB[slug] !== undefined);
 
-  // Match % = 1 - average normalized difference
+  const allWatchedSlugs = new Set([...Object.keys(watchedA), ...Object.keys(watchedB)]);
+  const bothWatched = [...allWatchedSlugs].filter(slug => watchedA[slug] && watchedB[slug]);
+  const onlyA = [...allWatchedSlugs].filter(slug => watchedA[slug] && !watchedB[slug]);
+  const onlyB = [...allWatchedSlugs].filter(slug => !watchedA[slug] && watchedB[slug]);
+
   let totalDiff = 0;
   const clashFilms = [];
   const agreements = [];
 
-  sharedFilms.forEach(slug => {
+  bothRated.forEach(slug => {
     const rA = ratingsA[slug];
     const rB = ratingsB[slug];
     const diff = Math.abs(rA - rB);
     totalDiff += diff;
-
-    const film = { 
-      slug, 
-      name: allMeta[slug]?.name || slug,
-      ratingA: rA, 
-      ratingB: rB, 
-      diff 
-    };
-
-    if (diff >= 2) clashFilms.push(film); // 2+ star gap = CLASH
+    const film = { slug, name: allMeta[slug]?.name || slug, ratingA: rA, ratingB: rB, diff };
+    if (diff >= 2) clashFilms.push(film);
     if (diff <= 0.5) agreements.push(film);
   });
 
-  const avgDiff = totalDiff / sharedFilms.length;
-  const matchPercent = Math.round((1 - avgDiff / 4.5) * 100); // max diff is 4.5 (0.5 vs 5)
+  const avgDiff = bothRated.length > 0 ? totalDiff / bothRated.length : 0;
+  const matchPercent = bothRated.length > 0
+    ? Math.max(0, Math.min(100, Math.round((1 - avgDiff / 4.5) * 100)))
+    : 0;
 
   clashFilms.sort((a, b) => b.diff - a.diff);
   agreements.sort((a, b) => b.ratingA - a.ratingA);
 
+  const sharedWatchedList = bothWatched
+    .map(slug => ({
+      slug,
+      name: allMeta[slug]?.name || slug,
+      ratingA: ratingsA[slug] || null,
+      ratingB: ratingsB[slug] || null,
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .slice(0, 300);
+
   return {
-    matchPercent: Math.max(0, Math.min(100, matchPercent)),
-    sharedCount: sharedFilms.length,
-    clashFilms: clashFilms.slice(0, 10),
-    agreements: agreements.slice(0, 10),
+    matchPercent,
+    sharedRatedCount: bothRated.length,
+    sharedWatchedCount: bothWatched.length,
+    onlyACount: onlyA.length,
+    onlyBCount: onlyB.length,
+    clashFilms: clashFilms.slice(0, 15),
+    agreements: agreements.slice(0, 15),
+    sharedWatchedList,
   };
 }
 
-// Genre taste from recent films
-async function getUserGenres(username) {
-  const genres = {};
-  try {
-    const html = await fetchLBD(`https://letterboxd.com/${username}/films/genre/`);
-    const $ = cheerio.load(html);
-    
-    // Scrape genre stats from the genre page
-    $('a.genre').each((_, el) => {
-      const $el = $(el);
-      const genre = $el.text().trim();
-      const countText = $el.find('span').text().trim();
-      const count = parseInt(countText.replace(/,/g, '')) || 0;
-      if (genre && count > 0) genres[genre] = count;
-    });
-  } catch (e) {
-    // fallback: empty
-  }
-  return genres;
-}
-
-// ─── ROUTES ───────────────────────────────────────────────────
-
-// Validate & fetch user
-app.get('/api/user/:username', async (req, res) => {
-  try {
-    const { username } = req.params;
-    const profile = await getUserProfile(username);
-    res.json({ success: true, user: profile });
-  } catch (e) {
-    res.status(404).json({ success: false, error: e.message });
-  }
-});
-
-// Full scan of a user's ratings
 app.get('/api/scan/:username', async (req, res) => {
   try {
     const { username } = req.params;
     console.log(`Scanning ${username}...`);
-    const [profile, { ratings, filmMeta }] = await Promise.all([
+
+    const [profile, { ratings, filmMeta, watched }] = await Promise.all([
       getUserProfile(username),
-      getUserRatings(username),
+      scrapeFilmPage(username, 'watched', 10),
     ]);
-    
-    const filmCount = Object.keys(ratings).length;
-    console.log(`  → ${filmCount} rated films found`);
-    
-    res.json({ success: true, profile, ratings, filmMeta, filmCount });
+
+    const watchedCount = Object.keys(watched).length;
+    const ratedCount = Object.keys(ratings).length;
+    console.log(`  -> ${watchedCount} watched, ${ratedCount} rated`);
+
+    res.json({ success: true, profile, ratings, filmMeta, watched, watchedCount, ratedCount });
   } catch (e) {
-    console.error(e);
+    console.error(e.message);
     res.status(500).json({ success: false, error: e.message });
   }
 });
 
-// Compare two scanned users (client sends the data)
 app.post('/api/compare', (req, res) => {
   try {
     const { userA, userB } = req.body;
@@ -211,5 +174,5 @@ app.post('/api/compare', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`\n🎬 Letterboxd Clash running at http://localhost:${PORT}\n`);
+  console.log(`\n Letterboxd Clash running at http://localhost:${PORT}\n`);
 });
